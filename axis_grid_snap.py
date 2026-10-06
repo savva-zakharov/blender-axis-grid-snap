@@ -568,7 +568,8 @@ NUMPAD_CHARS = {
 }
 # Characters that may start a typed value; once typing, unit letters etc. are accepted too.
 NUM_START_CHARS = set("0123456789.-+(")
-NUM_CHARS = NUM_START_CHARS | set(",)*/ '\"") | set("abcdefghijklmnopqrstuvw")
+# No 'a' (absolute-position toggle) and no x/y/z (axis locks); no length unit needs them.
+NUM_CHARS = NUM_START_CHARS | set(",)*/ '\"") | set("bcdefghijklmnopqrstuvw")
 
 
 def _parse_length(context, text):
@@ -778,6 +779,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         self.snap_toggle = context.scene.tool_settings.use_snap  # the header's magnet button
         self.snap = self.snap_toggle
         self.num_text = ""              # typed distance; when non-empty it overrides the mouse
+        self.abs_coords = False         # A key: typed values are grid positions, not distances
         self.mouse_start = Vector((event.mouse_region_x, event.mouse_region_y))
         self.mouse = self.mouse_start.copy()
         self.delta = Vector()
@@ -791,7 +793,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         context.workspace.status_text_set(
             "LMB/Enter: confirm   RMB/Esc: cancel   X/Y/Z: axis   "
             "Shift+X/Y/Z: plane   Ctrl: toggle snap   "
-            "Type: distance (a,b for planes)   Backspace: edit")
+            "Type: distance (a,b for planes)   A: typed = absolute position   Backspace: edit")
         self.update(context)
         return {'RUNNING_MODAL'}
 
@@ -836,8 +838,9 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             return None
         # Relative: typed values follow the direction the mouse has dragged along each axis,
         # so "1" after dragging toward -X moves -1 (and "-1" moves back toward +X).
+        # Absolute coordinates (A key) are positions, so the mouse direction doesn't apply.
         signs = Vector((1.0, 1.0, 1.0))
-        if self.relative_dir:
+        if self.relative_dir and not self.abs_coords:
             mouse = self.mouse_delta(context, axes)
             if mouse is not None:
                 for i in axes:
@@ -847,11 +850,16 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         for i, text in zip(axes, parts):
             text = text.strip()
             if text in {"", "-", "+"}:
-                continue  # not typed yet -> 0
+                continue  # not typed yet -> stays where it is on this axis
             value = _parse_length(context, text)
             if value is None:
                 return None
-            delta[i] = value * signs[i]
+            if self.abs_coords:
+                # Position on the grid, measured from the grid origin in orientation space
+                # (self.pivot is already relative to that origin).
+                delta[i] = value - self.pivot[i]
+            else:
+                delta[i] = value * signs[i]
         return delta
 
     def mouse_delta(self, context, axes):
@@ -941,9 +949,15 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             if self.auto_locked:
                 label += " auto"
         text = f"Axis Grid Move [{label} {self.orient_name}]   "
-        if self.num_text:
-            text += f"Input: {self.num_text}|" + ("  (invalid)" if invalid else "") + "   "
-        text += "   ".join(f"{'XYZ'[i]}: {_fmt(context, self.delta[i])}" for i in axes)
+        mode = " (absolute)" if self.abs_coords else ""
+        if self.num_text or self.abs_coords:
+            text += f"Input{mode}: {self.num_text}|" + ("  (invalid)" if invalid else "") + "   "
+        if self.abs_coords and self.num_text:
+            # Show where it lands on the grid, then the distance moved.
+            text += "   ".join(f"{'XYZ'[i]} at {_fmt(context, self.target[i])} "
+                               f"(moved {_fmt(context, self.delta[i])})" for i in axes)
+        else:
+            text += "   ".join(f"{'XYZ'[i]}: {_fmt(context, self.delta[i])}" for i in axes)
         if self.num_text:
             if self.snap and self.snap_typed:
                 text += "   (snapped to grid)"
@@ -975,6 +989,10 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             new = ('PLANE' if event.shift else 'AXIS', 'XYZ'.index(t))
             # Pressing the same key again releases the lock (back to free / auto lock).
             self.user_constraint = None if self.user_constraint == new else new
+            self.update(context)
+
+        elif t == 'A' and event.value == 'PRESS' and not (event.ctrl or event.alt or event.shift):
+            self.abs_coords = not self.abs_coords
             self.update(context)
 
         elif t == 'BACK_SPACE' and event.value == 'PRESS' and self.num_text:
