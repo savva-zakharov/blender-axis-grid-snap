@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "axis_grid_snap"
+version = "0.1.0"
+name = "Axis Grid Snap"
+tagline = "Move with per-axis grid spacing, rulers and CAD-style snapping"
+maintainer = "Savva <savva@darmodyarchitecture.com>"
+type = "add-on"
+
+tags = ["3D View", "Object", "Mesh"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Save and load grid spacing presets"

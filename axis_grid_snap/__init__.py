@@ -1,10 +1,13 @@
+# Packaged as a Blender extension (see blender_manifest.toml, which takes precedence).
+# bl_info is kept so the folder still installs as a legacy add-on.
 bl_info = {
     "name": "Axis Grid Snap",
+    "author": "Savva",
     "version": (0, 1, 0),
-    "blender": (3, 6, 0),
+    "blender": (4, 2, 0),
     "location": "3D View > Sidebar > Grid Snap  |  G in Object / Mesh Edit Mode",
-    "description": "Move objects with separate snapping increments per axis, "
-                   "with a ruler (single axis) or grid floor (plane) overlay",
+    "description": "Move with separate grid spacing per axis, double grids, ruler and grid "
+                   "overlays, typed and CAD-style point-to-point moves",
     "category": "3D View",
 }
 
@@ -14,6 +17,7 @@ import blf
 import bmesh
 import bpy
 import gpu
+import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty
 from bpy_extras import view3d_utils
 from bl_operators.presets import AddPresetBase
@@ -176,22 +180,22 @@ class AxisGrid:
 
 def _grid_base(op, axis):
     """Orientation-space coordinate of grid line 0 along an axis."""
-    return 0.0 if op.absolute else op.pivot[axis]
+    return 0.0 if op.grid_absolute else op.anchor[axis]
 
 
 MAX_OVERLAY_LINES = 400  # per axis, so a long move can't build a huge overlay
 
 
 class _Span:
-    """Grid lines drawn along one axis. The overlay stays anchored at the move's start
-    point (op.pivot); the range covers the start and the current position plus `extent`
+    """Grid lines drawn along one axis. The overlay stays anchored at op.anchor (the move's
+    start point, or the CAD base point); the range covers it and the current position plus `extent`
     lines either side, and lines fade with their distance from that stretch."""
 
     def __init__(self, op, axis, grid, extent):
         self.grid = grid
         self.extent = extent
         self.base = _grid_base(op, axis)
-        self.origin = grid.nearest(op.pivot[axis] - self.base)   # line at the start point
+        self.origin = grid.nearest(op.anchor[axis] - self.base)   # line at the start point
         self.current = grid.nearest(op.target[axis] - self.base)  # line at the object now
         near, far = sorted((self.origin, self.current))
         self.lo, self.hi = near - extent, far + extent
@@ -226,7 +230,7 @@ def _ruler_frame(op, axis, grid, view_dir, extent):
     span = _Span(op, axis, grid, extent)
 
     def at(m):
-        p = op.pivot.copy()
+        p = op.anchor.copy()
         p[axis] = span.coord(m)
         return p
 
@@ -241,7 +245,7 @@ def _ruler_lines(op, axis, grid, extent, view_dir):
 
     # Faint infinite constraint line
     far = 10000.0
-    pos += [op.pivot - a * far, op.pivot + a * far]
+    pos += [op.anchor - a * far, op.anchor + a * far]
     col += [(r, g, b, 0.25)] * 2
 
     # Ruler spine, one segment per interval. On a double grid the A intervals are
@@ -271,7 +275,7 @@ def _plane_lines(op, normal_axis, grids, extent):
     spans = {u: _Span(op, u, grids[u], extent), v: _Span(op, v, grids[v], extent)}
 
     def point(pu, pv):
-        p = op.pivot.copy()
+        p = op.anchor.copy()
         p[u], p[v] = pu, pv
         return p
 
@@ -313,8 +317,8 @@ def _cross_lines(op, grids):
 
 def draw_overlay(op):
     rv3d = bpy.context.region_data
-    if rv3d is None:
-        return
+    if rv3d is None or op.cad == 'BASE':
+        return  # nothing moves while picking the CAD base point; draw_labels shows the marker
     view_dir = op.rot_inv @ (rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)))
     grids, extent = op.grids, op.extent
 
@@ -327,7 +331,7 @@ def draw_overlay(op):
         pos, col = _cross_lines(op, grids)
 
     # Travel line from start to current position
-    pos += [op.pivot, op.target]
+    pos += [op.anchor, op.target]
     col += [(1.0, 1.0, 1.0, 0.5)] * 2
     pos = [op.to_world(p) for p in pos]
 
@@ -340,6 +344,54 @@ def draw_overlay(op):
     gpu.state.blend_set('NONE')
 
 
+CAD_MARKER_COLORS = {
+    'VERTEX': (1.0, 0.6, 0.1, 1.0),   # orange square: snapped to a vertex / object origin
+    'SURFACE': (0.3, 0.8, 1.0, 1.0),  # blue diamond: on a surface under the cursor
+    'FREE': (0.85, 0.85, 0.85, 1.0),  # grey cross: in space (view or constraint plane)
+}
+
+
+def _draw_cad_markers(op):
+    """CAD move markers in screen space: the picked base point (white) and what the
+    cursor would snap to right now (coloured by snap kind)."""
+    context = bpy.context
+    region, rv3d = context.region, context.region_data
+    if rv3d is None:
+        return
+    s = 6 * context.preferences.system.ui_scale
+    lines = []  # (2D points as LINES pairs, colour)
+
+    def marker(world, kind, color):
+        p = view3d_utils.location_3d_to_region_2d(region, rv3d, world)
+        if p is None:
+            return
+        x, y = p
+        if kind == 'VERTEX' or kind == 'BASE':
+            pts = [(x - s, y - s), (x + s, y - s), (x + s, y - s), (x + s, y + s),
+                   (x + s, y + s), (x - s, y + s), (x - s, y + s), (x - s, y - s)]
+        elif kind == 'SURFACE':
+            pts = [(x, y - s), (x + s, y), (x + s, y), (x, y + s),
+                   (x, y + s), (x - s, y), (x - s, y), (x, y - s)]
+        else:
+            pts = [(x - s, y), (x + s, y), (x, y - s), (x, y + s)]
+        lines.append((pts, color))
+
+    if op.cad == 'TARGET':
+        marker(op.cad_base_world, 'BASE', (1.0, 1.0, 1.0, 1.0))
+    if op.cad_pick is not None:
+        world, kind = op.cad_pick
+        marker(world, kind, CAD_MARKER_COLORS[kind])
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(2.0)
+    for pts, color in lines:
+        shader.uniform_float("color", color)
+        batch_for_shader(shader, 'LINES', {"pos": pts}).draw(shader)
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set('NONE')
+
+
 def draw_labels(op):
     """Screen-space value labels for the ruler (axis moves) and grid floor (plane moves).
 
@@ -349,6 +401,10 @@ def draw_labels(op):
     On the grid floor that gives two crossing rulers. Labels that would overlap one already
     drawn are skipped, nearest-to-current first, so zooming out thins them.
     """
+    if op.cad:
+        _draw_cad_markers(op)
+        if op.cad == 'BASE':
+            return
     if not op.show_values or not op.constraint:
         return
     context = bpy.context
@@ -715,6 +771,84 @@ def _snap_menu_entry(self, context):
     self.layout.operator(VIEW3D_OT_axis_grid_snap_selection.bl_idname, icon='SNAP_GRID')
 
 
+class SnapCloud:
+    """World-space points the CAD move can snap to, gathered once when CAD mode starts.
+
+    Visible mesh vertices (evaluated, so modifiers and instances count) and the origins of
+    other visible objects. Points on the geometry being moved are kept separately: they are
+    valid base points (grab the selection by its own corner) but not targets.
+    """
+
+    def __init__(self, context, mover):
+        static, moving = [], []
+        depsgraph = context.evaluated_depsgraph_get()
+        edit_objs = set()
+
+        if isinstance(mover, MeshMover):
+            for ob, bm, _verts, _start, _inv in mover.items:
+                edit_objs.add(ob)
+                mw = ob.matrix_world
+                for v in bm.verts:
+                    if not v.hide:
+                        (moving if v.select else static).append(tuple(mw @ v.co))
+            moving_objs = set()
+        else:
+            moving_objs = set(mover.objs)
+
+        def is_moving(ob):
+            while ob is not None:  # children follow a moved parent
+                if ob in moving_objs:
+                    return True
+                ob = ob.parent
+            return False
+
+        arrays_static, arrays_moving = [], []
+        for inst in depsgraph.object_instances:
+            ob = inst.object
+            orig = ob.original
+            if orig in edit_objs:
+                continue  # taken from the edit mesh above
+            if not inst.is_instance and not orig.visible_get():
+                continue
+            parent = inst.parent.original if inst.is_instance and inst.parent else None
+            moves = is_moving(orig) or (parent is not None and is_moving(parent))
+            mw = np.array(inst.matrix_world, dtype=np.float64)
+            if ob.type == 'MESH' and len(ob.data.vertices):
+                co = np.empty(len(ob.data.vertices) * 3, dtype=np.float32)
+                ob.data.vertices.foreach_get("co", co)
+                co = co.reshape(-1, 3).astype(np.float64) @ mw[:3, :3].T + mw[:3, 3]
+                (arrays_moving if moves else arrays_static).append(co)
+            else:
+                (moving if moves else static).append(tuple(mw[:3, 3]))
+
+        def stack(points, arrays):
+            parts = arrays + ([np.array(points, dtype=np.float64)] if points else [])
+            return np.concatenate(parts) if parts else np.empty((0, 3))
+
+        self.static = stack(static, arrays_static)
+        self.moving = stack(moving, arrays_moving)
+        self.moving_objs = moving_objs
+
+    def nearest(self, region, rv3d, coord, radius, include_moving):
+        """Closest point to the mouse on screen within `radius` pixels, or None."""
+        pts = np.concatenate((self.static, self.moving)) if include_moving else self.static
+        if not len(pts):
+            return None
+        m = np.array(rv3d.perspective_matrix, dtype=np.float64)
+        clip = pts @ m[:, :3].T + m[:, 3]
+        w = clip[:, 3]
+        visible = w > 1e-6
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sx = (clip[:, 0] / w * 0.5 + 0.5) * region.width
+            sy = (clip[:, 1] / w * 0.5 + 0.5) * region.height
+        d2 = (sx - coord[0]) ** 2 + (sy - coord[1]) ** 2
+        d2[~visible] = np.inf
+        i = int(np.argmin(d2))
+        if d2[i] > radius * radius:
+            return None
+        return Vector(pts[i])
+
+
 def _make_mover(context):
     return MeshMover(context) if context.mode == 'EDIT_MESH' else ObjectMover(context)
 
@@ -784,6 +918,16 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         self.mouse = self.mouse_start.copy()
         self.delta = Vector()
         self.target = self.pivot.copy()
+        # The point offsets are measured from: the pivot, or the CAD base point once picked.
+        self.anchor = self.pivot.copy()
+        self.anchor_world = pivot_world.copy()
+        self.grid_absolute = self.absolute
+        # CAD move (M key): None, 'BASE' (picking the base point) or 'TARGET'.
+        self.cad = None
+        self.cad_cloud = None           # SnapCloud, built on first use
+        self.cad_pick = None            # (world point, 'VERTEX'|'SURFACE'|'FREE') under the cursor
+        self.cad_base_world = None
+        self.cad_exact = False          # target landed on a vertex: don't grid-round it
 
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             draw_overlay, (self,), 'WINDOW', 'POST_VIEW')
@@ -793,7 +937,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         context.workspace.status_text_set(
             "LMB/Enter: confirm   RMB/Esc: cancel   X/Y/Z: axis   "
             "Shift+X/Y/Z: plane   Ctrl: toggle snap   "
-            "Type: distance (a,b for planes)   A: typed = absolute position   Backspace: edit")
+            "Type: distance (a,b for planes)   A: typed = absolute position   Backspace: edit   "
+            "M: CAD move (click base point, then target)")
         self.update(context)
         return {'RUNNING_MODAL'}
 
@@ -812,11 +957,12 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         return (i,) if kind == 'AXIS' else tuple(j for j in range(3) if j != i)
 
     def project(self, context, coord):
-        """Mouse position -> orientation-space point on the current constraint line/plane."""
+        """Mouse position -> orientation-space point on the current constraint line/plane
+        through the anchor (the pivot, or the CAD base point)."""
         region, rv3d = context.region, context.region_data
         ro = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
         rd = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
-        p0 = self.pivot_world
+        p0 = self.anchor_world
         if self.constraint and self.constraint[0] == 'AXIS':
             axis = self.rot @ AXIS_VECS[self.constraint[1]]
             hit = geometry.intersect_line_line(p0, p0 + axis, ro, ro + rd)
@@ -856,14 +1002,17 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
                 return None
             if self.abs_coords:
                 # Position on the grid, measured from the grid origin in orientation space
-                # (self.pivot is already relative to that origin).
-                delta[i] = value - self.pivot[i]
+                # (the anchor is already relative to that origin). In CAD mode it is the
+                # base point that lands there.
+                delta[i] = value - self.anchor[i]
             else:
                 delta[i] = value * signs[i]
         return delta
 
     def mouse_delta(self, context, axes):
         """Unsnapped mouse movement on the active axes, or None if it can't be projected."""
+        if self.cad == 'TARGET':
+            return self.cad_delta(context, axes)
         a = self.project(context, self.mouse_start)
         b = self.project(context, self.mouse)
         if a is None or b is None:
@@ -873,6 +1022,79 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             if i not in axes:
                 delta[i] = 0.0
         return delta
+
+    # -- CAD move ------------------------------------------------------------
+
+    def cad_pick_point(self, context, include_moving, allow_surface):
+        """What a click would pick: nearest vertex/origin on screen, else the surface under
+        the cursor, else a point on the view/constraint plane through the anchor.
+        Returns (world point, kind) or None."""
+        region, rv3d = context.region, context.region_data
+        radius = 12 * context.preferences.system.ui_scale
+        p = self.cad_cloud.nearest(region, rv3d, self.mouse, radius, include_moving)
+        if p is not None:
+            return p, 'VERTEX'
+        if allow_surface:
+            ro = view3d_utils.region_2d_to_origin_3d(region, rv3d, self.mouse)
+            rd = view3d_utils.region_2d_to_vector_3d(region, rv3d, self.mouse)
+            hit, loc, _n, _i, obj, _m = context.scene.ray_cast(
+                context.evaluated_depsgraph_get(), ro, rd)
+            if hit and (include_moving or not self.cad_is_moving(obj)):
+                return loc.copy(), 'SURFACE'
+        local = self.project(context, self.mouse)
+        return (self.to_world(local), 'FREE') if local is not None else None
+
+    def cad_is_moving(self, obj):
+        """Whether a ray-cast hit belongs to geometry being moved (not a valid target)."""
+        if isinstance(self.mover, MeshMover):
+            # Edit Mode: the edited meshes contain the moving selection; skip them to be safe.
+            return obj.original in {item[0] for item in self.mover.items}
+        ob = obj.original
+        while ob is not None:
+            if ob in self.cad_cloud.moving_objs:
+                return True
+            ob = ob.parent
+        return False
+
+    def cad_delta(self, context, axes):
+        """Offset from the base point to the picked target, on the active axes."""
+        # Surface hits only make sense for a free move; with a lock the target is
+        # projected onto the axis/plane through the base point instead.
+        self.cad_pick = self.cad_pick_point(context, include_moving=False,
+                                            allow_surface=self.constraint is None)
+        if self.cad_pick is None:
+            return None
+        world, kind = self.cad_pick
+        self.cad_exact = kind == 'VERTEX'
+        delta = self.to_local(world) - self.anchor
+        for i in range(3):
+            if i not in axes:
+                delta[i] = 0.0
+        return delta
+
+    def enter_cad(self, context):
+        if self.cad_cloud is None:
+            self.cad_cloud = SnapCloud(context, self.mover)
+        self.mover.restore()
+        self.cad = 'BASE'
+        self.num_text = ""
+        self.update(context)
+
+    def exit_cad(self, context):
+        self.cad = None
+        self.cad_pick = None
+        self.cad_exact = False
+        self.anchor = self.pivot.copy()
+        self.anchor_world = self.pivot_world.copy()
+        self.update(context)
+
+    def set_cad_base(self, context):
+        world, _kind = self.cad_pick
+        self.cad_base_world = world.copy()
+        self.anchor_world = world.copy()
+        self.anchor = self.to_local(world)
+        self.cad = 'TARGET'
+        self.update(context)
 
     def auto_constraint(self, context):
         """Plane lock for a free move when the view looks almost straight along an axis.
@@ -910,6 +1132,11 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             self.auto_locked = self.constraint is not None
         axes = self.active_axes()
 
+        if self.cad == 'BASE':  # nothing moves yet; just track what a click would pick
+            self.cad_pick = self.cad_pick_point(context, include_moving=True, allow_surface=True)
+            self.set_header(context, axes)
+            return
+
         if self.num_text:
             delta = self.typed_delta(context, axes)
             if delta is None:
@@ -920,10 +1147,12 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             delta = self.mouse_delta(context, axes)
             if delta is None:
                 return
-            snap = self.snap
+            # A CAD target picked on a vertex is exact; anything else follows the grid.
+            snap = self.snap and not (self.cad and self.cad_exact)
 
         if snap:
-            if self.absolute:
+            # CAD offsets count grid steps from the base point, not world grid lines.
+            if self.absolute and not self.cad:
                 target = self.pivot + delta
                 for i in axes:
                     target[i] = self.grids[i].snap(target[i])
@@ -936,7 +1165,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
     def apply(self, context, delta, axes):
         self.delta = delta
-        self.target = self.pivot + delta
+        self.target = self.anchor + delta
+        self.grid_absolute = self.absolute and not self.cad
         self.world_delta = self.rot @ delta
         self.mover.apply(self.world_delta)
         self.set_header(context, axes)
@@ -948,7 +1178,15 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             label = "XYZ"[i] if kind == 'AXIS' else "".join("XYZ"[j] for j in axes)
             if self.auto_locked:
                 label += " auto"
-        text = f"Axis Grid Move [{label} {self.orient_name}]   "
+        if self.cad == 'BASE':
+            kind = {'VERTEX': "vertex", 'SURFACE': "surface", 'FREE': "in space"}.get(
+                self.cad_pick[1] if self.cad_pick else None, "nothing")
+            context.area.header_text_set(
+                f"Axis Grid Move (CAD) [{label} {self.orient_name}]   Click the base point "
+                f"(under cursor: {kind})   M: back to normal move")
+            return
+        cad = " (CAD)" if self.cad else ""
+        text = f"Axis Grid Move{cad} [{label} {self.orient_name}]   "
         mode = " (absolute)" if self.abs_coords else ""
         if self.num_text or self.abs_coords:
             text += f"Input{mode}: {self.num_text}|" + ("  (invalid)" if invalid else "") + "   "
@@ -961,6 +1199,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         if self.num_text:
             if self.snap and self.snap_typed:
                 text += "   (snapped to grid)"
+        elif self.cad and self.cad_exact:
+            text += "   (on vertex)"
         elif not self.snap:
             text += "   (snap off)"
         context.area.header_text_set(text)
@@ -994,6 +1234,23 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         elif t == 'A' and event.value == 'PRESS' and not (event.ctrl or event.alt or event.shift):
             self.abs_coords = not self.abs_coords
             self.update(context)
+
+        # M toggles the CAD move, unless a value is being typed ("m" is part of cm/mm units).
+        elif (t == 'M' and event.value == 'PRESS' and not self.num_text
+              and not (event.ctrl or event.alt or event.shift)):
+            if self.cad:
+                self.exit_cad(context)
+            else:
+                self.enter_cad(context)
+
+        elif self.cad == 'BASE':
+            if t == 'LEFTMOUSE' and event.value == 'PRESS' and self.cad_pick is not None:
+                self.set_cad_base(context)
+            elif t in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+                self.mover.restore()
+                self.cleanup(context)
+                return {'CANCELLED'}
+            # Everything else (typing, Enter, ...) waits until the base point is picked.
 
         elif t == 'BACK_SPACE' and event.value == 'PRESS' and self.num_text:
             # Ctrl+Backspace clears; emptying the input hands control back to the mouse.
