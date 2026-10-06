@@ -10,6 +10,7 @@ bl_info = {
 
 import math
 
+import blf
 import bmesh
 import bpy
 import gpu
@@ -93,6 +94,35 @@ class AxisGridSettings(bpy.types.PropertyGroup):
                     "movement snaps (follows the snap toggle and Ctrl). Off: typed values are exact",
         default=False,
     )
+    auto_lock: BoolProperty(
+        name="Auto Plane Lock",
+        description="When moving without an axis lock and the view looks almost straight "
+                    "along an axis (e.g. top view), lock to the plane facing the view",
+        default=True,
+    )
+    auto_lock_source: EnumProperty(
+        name="Lock From",
+        description="What is compared with the axes to decide the automatic plane lock",
+        items=(
+            ('VIEW', "View", "Lock when the view looks almost straight along an axis"),
+            ('NORMAL', "Normal",
+             "Lock when the selected geometry's normal is close to an axis, so a face moves "
+             "within its own plane (Edit Mode; Object Mode uses the view)"),
+            ('BOTH', "Both",
+             "Use the selection's normal when it is close to an axis, otherwise the view"),
+        ),
+        default='VIEW',
+    )
+    auto_lock_angle: FloatProperty(
+        name="Within",
+        description="How close the view must be to looking straight along an axis",
+        default=math.radians(15.0), min=0.0, max=math.radians(45.0), subtype='ANGLE',
+    )
+    show_values: BoolProperty(
+        name="Show Ruler Values",
+        description="Label the ruler's major lines and the current position with their values",
+        default=True,
+    )
     extent: IntProperty(
         name="Overlay Extent",
         description="Number of increments drawn on each side of the pivot",
@@ -149,27 +179,65 @@ def _grid_base(op, axis):
     return 0.0 if op.absolute else op.pivot[axis]
 
 
-def _fade(k, center, extent):
-    return max(0.0, 1.0 - abs(k - center) / (extent + 1))
+MAX_OVERLAY_LINES = 400  # per axis, so a long move can't build a huge overlay
 
 
-def _ruler_lines(op, axis, grid, extent, view_dir):
-    pos, col = [], []
+class _Span:
+    """Grid lines drawn along one axis. The overlay stays anchored at the move's start
+    point (op.pivot); the range covers the start and the current position plus `extent`
+    lines either side, and lines fade with their distance from that stretch."""
+
+    def __init__(self, op, axis, grid, extent):
+        self.grid = grid
+        self.extent = extent
+        self.base = _grid_base(op, axis)
+        self.origin = grid.nearest(op.pivot[axis] - self.base)   # line at the start point
+        self.current = grid.nearest(op.target[axis] - self.base)  # line at the object now
+        near, far = sorted((self.origin, self.current))
+        self.lo, self.hi = near - extent, far + extent
+        if self.hi - self.lo > MAX_OVERLAY_LINES:  # very long move: keep the area around the object
+            half = MAX_OVERLAY_LINES // 2
+            self.lo, self.hi = self.current - half, self.current + half
+        self._near, self._far = near, far
+
+    def coord(self, m):
+        return self.base + self.grid.pos(m)
+
+    def lines(self):
+        return range(self.lo, self.hi + 1)
+
+    def fade(self, m):
+        gap = self._near - m if m < self._near else (m - self._far if m > self._far else 0)
+        return max(0.0, 1.0 - gap / (self.extent + 1))
+
+    def closeness(self, m):
+        """Label priority: current position first, then nearest to it."""
+        return abs(m - self.current)
+
+
+def _ruler_frame(op, axis, grid, view_dir, extent):
+    """Shared ruler geometry: (axis vector, tick direction, span,
+    at(m) -> orientation-space point of grid line m on the ruler through the start point)."""
     a = AXIS_VECS[axis]
     perp = a.cross(view_dir)
     if perp.length < 1e-6:
         perp = AXIS_VECS[(axis + 1) % 3].copy()
     perp.normalize()
-
-    r, g, b = AXIS_COLORS[axis]
-    base = _grid_base(op, axis)
-    center = grid.nearest(op.target[axis] - base)
-    size = grid.scale
+    span = _Span(op, axis, grid, extent)
 
     def at(m):
-        p = op.target.copy()
-        p[axis] = base + grid.pos(m)
+        p = op.pivot.copy()
+        p[axis] = span.coord(m)
         return p
+
+    return a, perp, span, at
+
+
+def _ruler_lines(op, axis, grid, extent, view_dir):
+    pos, col = [], []
+    a, perp, span, at = _ruler_frame(op, axis, grid, view_dir, extent)
+    r, g, b = AXIS_COLORS[axis]
+    size = grid.scale
 
     # Faint infinite constraint line
     far = 10000.0
@@ -178,15 +246,15 @@ def _ruler_lines(op, axis, grid, extent, view_dir):
 
     # Ruler spine, one segment per interval. On a double grid the A intervals are
     # drawn bright and the B intervals dim, so the alternation reads at a glance.
-    for m in range(center - extent, center + extent):
+    for m in range(span.lo, span.hi):
         alpha = 0.9 if not grid.double or m % 2 == 0 else 0.35
         pos += [at(m), at(m + 1)]
         col += [(r, g, b, alpha)] * 2
 
-    for m in range(center - extent, center + extent + 1):
+    for m in span.lines():
         p = at(m)
-        alpha = _fade(m, center, extent)
-        if m == center:
+        alpha = span.fade(m)
+        if m == span.current:
             length, c = 0.6 * size, (1.0, 1.0, 1.0, 1.0)
         elif grid.is_major(m):
             length, c = 0.35 * size, (r, g, b, alpha)
@@ -200,11 +268,7 @@ def _ruler_lines(op, axis, grid, extent, view_dir):
 def _plane_lines(op, normal_axis, grids, extent):
     pos, col = [], []
     u, v = [i for i in range(3) if i != normal_axis]
-    base_u, base_v = _grid_base(op, u), _grid_base(op, v)
-    cu = grids[u].nearest(op.target[u] - base_u)
-    cv = grids[v].nearest(op.target[v] - base_v)
-    u_lo, u_hi = base_u + grids[u].pos(cu - extent), base_u + grids[u].pos(cu + extent)
-    v_lo, v_hi = base_v + grids[v].pos(cv - extent), base_v + grids[v].pos(cv + extent)
+    spans = {u: _Span(op, u, grids[u], extent), v: _Span(op, v, grids[v], extent)}
 
     def point(pu, pv):
         p = op.pivot.copy()
@@ -213,16 +277,15 @@ def _plane_lines(op, normal_axis, grids, extent):
 
     # Lines running along u (one per v grid line) take v's axis colour, and vice versa,
     # so you can tell which spacing is which.
-    for axis, c0, other_lo, other_hi, base in (
-        (v, cv, u_lo, u_hi, base_v),
-        (u, cu, v_lo, v_hi, base_u),
-    ):
+    for axis, other in ((v, u), (u, v)):
+        span, other_span = spans[axis], spans[other]
+        other_lo, other_hi = other_span.coord(other_span.lo), other_span.coord(other_span.hi)
         grid = grids[axis]
         r, g, b = AXIS_COLORS[axis]
-        for m in range(c0 - extent, c0 + extent + 1):
-            t = base + grid.pos(m)
-            fade = _fade(m, c0, extent)
-            if m == c0:
+        for m in span.lines():
+            t = span.coord(m)
+            fade = span.fade(m)
+            if m == span.current:
                 c = (1.0, 1.0, 1.0, 0.9)
             elif grid.is_major(m):
                 c = (r, g, b, 0.8 * fade)
@@ -277,6 +340,82 @@ def draw_overlay(op):
     gpu.state.blend_set('NONE')
 
 
+def draw_labels(op):
+    """Screen-space value labels for the ruler (axis moves) and grid floor (plane moves).
+
+    Each labelled axis is read like a ruler through the move's start point (it stays put
+    while the object moves): major lines are labelled on one side in the axis colour, the
+    object's current value in white on the other.
+    On the grid floor that gives two crossing rulers. Labels that would overlap one already
+    drawn are skipped, nearest-to-current first, so zooming out thins them.
+    """
+    if not op.show_values or not op.constraint:
+        return
+    context = bpy.context
+    region, rv3d = context.region, context.region_data
+    if rv3d is None:
+        return
+    kind, axis = op.constraint
+    view_dir = op.rot_inv @ (rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)))
+
+    # (axis, offset direction for its labels, extent) for each labelled axis
+    if kind == 'AXIS':
+        _a, perp, _span, _at = _ruler_frame(op, axis, op.grids[axis], view_dir, op.extent)
+        rulers = [(axis, perp, op.extent)]
+    else:
+        u, v = [i for i in range(3) if i != axis]
+        extent = min(op.extent, 60)  # same as the drawn grid
+        # Labels for one axis sit beside its line, pushed along the plane's other axis.
+        rulers = [(u, AXIS_VECS[v], extent), (v, AXIS_VECS[u], extent)]
+
+    font = 0
+    ui = context.preferences.system.ui_scale
+    blf.size(font, 11 * ui)
+    blf.enable(font, blf.SHADOW)
+    blf.shadow(font, 3, 0.0, 0.0, 0.0, 0.8)
+    blf.shadow_offset(font, 1, -1)
+    drawn = []
+
+    def place(at, grid, m, perp, side, color, tick_len):
+        p2 = view3d_utils.location_3d_to_region_2d(region, rv3d, op.to_world(at(m)))
+        q2 = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, op.to_world(at(m) + perp * (tick_len * side)))
+        if p2 is None or q2 is None:
+            return  # behind the view
+        d = q2 - p2
+        d = d.normalized() if d.length > 1e-3 else Vector((0.0, float(side)))
+        text = _fmt(context, grid.pos(m))
+        w, h = blf.dimensions(font, text)
+        # Push the label out past the tick end, by its half-extent in the push direction.
+        c = q2 + d * (6 * ui + abs(d.x) * w / 2 + abs(d.y) * h / 2)
+        rect = (c.x - w / 2 - 4, c.y - h / 2 - 2, c.x + w / 2 + 4, c.y + h / 2 + 2)
+        if rect[2] < 0 or rect[0] > region.width or rect[3] < 0 or rect[1] > region.height:
+            return
+        if any(rect[0] < o[2] and o[0] < rect[2] and rect[1] < o[3] and o[1] < rect[3] for o in drawn):
+            return
+        drawn.append(rect)
+        blf.color(font, *color)
+        blf.position(font, c.x - w / 2, c.y - h / 2, 0)
+        blf.draw(font, text)
+
+    # Build every label first, then place current values before majors and nearer before
+    # farther, so the most useful labels win when space runs out.
+    jobs = []
+    for ax, perp, extent in rulers:
+        grid = op.grids[ax]
+        _a, _p, span, at = _ruler_frame(op, ax, grid, view_dir, extent)
+        r, g, b = AXIS_COLORS[ax]
+        size = grid.scale
+        jobs.append((-1, (at, grid, span.current, perp, -1, (1.0, 1.0, 1.0, 1.0), 0.6 * size)))
+        for m in span.lines():
+            if m != span.current and grid.is_major(m):
+                color = (r, g, b, max(0.4, span.fade(m)))
+                jobs.append((span.closeness(m), (at, grid, m, perp, 1, color, 0.35 * size)))
+    for _order, args in sorted(jobs, key=lambda j: j[0]):
+        place(*args)
+    blf.disable(font, blf.SHADOW)
+
+
 # ---------------------------------------------------------------------------
 # Move operator
 # ---------------------------------------------------------------------------
@@ -294,6 +433,24 @@ def _root_objects(objs):
     return roots
 
 
+def _selection_normal(ob, unit=True):
+    """World-space average normal of an edit mesh's selected faces (else vertices).
+
+    With unit=False the summed, unnormalised vector is returned so several objects'
+    normals can be combined. None when there is no usable normal.
+    """
+    if ob.type != 'MESH':
+        return None
+    bm = bmesh.from_edit_mesh(ob.data)
+    faces = [f for f in bm.faces if f.select and not f.hide]
+    elems = faces or [v for v in bm.verts if v.select and not v.hide]
+    n = sum((e.normal for e in elems), Vector())
+    if n.length < 1e-9:
+        return None
+    n = ob.matrix_world.to_3x3().inverted_safe().transposed() @ n  # normals use the inverse transpose
+    return n.normalized() if unit else n
+
+
 def _edit_normal_rotation(ob):
     """Approximation of Blender's Normal orientation for the edit-mesh selection.
 
@@ -301,16 +458,11 @@ def _edit_normal_rotation(ob):
     edge of the active face, if there is one, so a face's grid lines up with its edges.
     Returns None when the selection has no usable normal.
     """
-    if ob.type != 'MESH':
+    z = _selection_normal(ob)
+    if z is None:
         return None
     bm = bmesh.from_edit_mesh(ob.data)
-    faces = [f for f in bm.faces if f.select]
-    elems = faces or [v for v in bm.verts if v.select]
-    n = sum((e.normal for e in elems), Vector())
-    if n.length < 1e-9:
-        return None
     mw3 = ob.matrix_world.to_3x3()
-    z = (mw3.inverted_safe().transposed() @ n).normalized()  # normals use the inverse transpose
 
     y = None
     active = bm.select_history.active
@@ -368,12 +520,39 @@ def _unit_scale(us):
     return us.scale_length if us.system != 'NONE' else 1.0
 
 
-def _fmt(context, value):
+# Metres per unit, and the symbol Blender shows, for Scene > Units > Length.
+LENGTH_UNITS = {
+    'KILOMETERS': (1000.0, "km"), 'METERS': (1.0, "m"), 'CENTIMETERS': (0.01, "cm"),
+    'MILLIMETERS': (0.001, "mm"), 'MICROMETERS': (1e-6, "µm"),
+    'MILES': (1609.344, "mi"), 'FEET': (0.3048, "'"), 'INCHES': (0.0254, '"'),
+    'THOU': (0.0000254, "thou"),
+}
+
+
+def _fmt(context, value, decimals=4):
+    """Format a length in the scene's chosen Length unit (not Blender's adaptive pick).
+
+    Adaptive length or Separate Units fall back to Blender's own formatting.
+    """
     us = context.scene.unit_settings
-    try:
-        return bpy.utils.units.to_string(us.system, 'LENGTH', value * _unit_scale(us), precision=4)
-    except Exception:
-        return f"{value:.4g}"
+    if us.system == 'NONE':
+        return f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    metres = value * _unit_scale(us)
+    unit = LENGTH_UNITS.get(us.length_unit)
+    if unit is None or us.use_separate:
+        try:
+            return bpy.utils.units.to_string(us.system, 'LENGTH', metres, precision=decimals,
+                                             split_unit=us.use_separate)
+        except Exception:
+            return f"{value:.{decimals}g}"
+    factor, symbol = unit
+    x = metres / factor
+    if 0 < abs(x) < 1:  # keep ~4 significant digits for small values (e.g. 0.000675 m)
+        decimals = min(8, decimals + math.ceil(-math.log10(abs(x))))
+    number = f"{x:.{decimals}f}".rstrip("0").rstrip(".")
+    if number == "-0":
+        number = "0"
+    return number + symbol if symbol in {"'", '"'} else f"{number} {symbol}"
 
 
 # Unitless typed numbers are read in the scene's chosen length unit, like Blender's own fields.
@@ -581,7 +760,21 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         self.relative_dir = settings.typed_direction == 'RELATIVE'
         self.snap_typed = settings.snap_typed
         self.extent = settings.extent
-        self.constraint = None          # None | ('AXIS', i) | ('PLANE', normal_i)
+        self.show_values = settings.show_values
+        self.constraint = None          # None | ('AXIS', i) | ('PLANE', normal_i); in effect now
+        self.user_constraint = None     # set by X/Y/Z keys; overrides the automatic lock
+        self.auto_locked = False
+        self.auto_angle = settings.auto_lock_angle if settings.auto_lock else None
+        # Lock From Normal / Both: compare the selection's normal (Edit Mode only; without a
+        # usable selection normal, e.g. in Object Mode, the view is used).
+        self.auto_source = settings.auto_lock_source
+        self.auto_normal = None
+        if self.auto_source in {'NORMAL', 'BOTH'} and context.mode == 'EDIT_MESH':
+            total = sum((n for n in (_selection_normal(ob, unit=False)
+                                     for ob in context.objects_in_mode_unique_data)
+                         if n is not None), Vector())
+            if total.length > 1e-9:
+                self.auto_normal = total.normalized()
         self.snap_toggle = context.scene.tool_settings.use_snap  # the header's magnet button
         self.snap = self.snap_toggle
         self.num_text = ""              # typed distance; when non-empty it overrides the mouse
@@ -592,6 +785,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             draw_overlay, (self,), 'WINDOW', 'POST_VIEW')
+        self._handle_px = bpy.types.SpaceView3D.draw_handler_add(
+            draw_labels, (self,), 'WINDOW', 'POST_PIXEL')
         context.window_manager.modal_handler_add(self)
         context.workspace.status_text_set(
             "LMB/Enter: confirm   RMB/Esc: cancel   X/Y/Z: axis   "
@@ -671,7 +866,40 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
                 delta[i] = 0.0
         return delta
 
+    def auto_constraint(self, context):
+        """Plane lock for a free move when the view looks almost straight along an axis.
+
+        Looking down Z (within the angle setting) -> XY plane, etc., using the move's
+        orientation axes. None when disabled or no axis is close enough.
+        """
+        if self.auto_angle is None:
+            return None
+        if self.auto_normal is not None:  # fixed for the move: translating keeps normals
+            lock = self.plane_facing(self.auto_normal)
+            if lock is not None or self.auto_source == 'NORMAL':
+                return lock
+            # 'BOTH': the normal isn't near an axis, so fall back to the view
+        rv3d = context.region_data
+        if rv3d is None:
+            return None
+        return self.plane_facing(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)))
+
+    def plane_facing(self, direction):
+        """('PLANE', i) if the world direction is within the auto-lock angle of axis i."""
+        direction = self.rot_inv @ direction
+        i = max(range(3), key=lambda k: abs(direction[k]))
+        if abs(direction[i]) >= math.cos(self.auto_angle):
+            return ('PLANE', i)
+        return None
+
     def update(self, context):
+        # The user's X/Y/Z choice wins; otherwise re-check the view, which can orbit mid-move.
+        self.auto_locked = False
+        if self.user_constraint is not None:
+            self.constraint = self.user_constraint
+        else:
+            self.constraint = self.auto_constraint(context)
+            self.auto_locked = self.constraint is not None
         axes = self.active_axes()
 
         if self.num_text:
@@ -710,6 +938,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         if self.constraint:
             kind, i = self.constraint
             label = "XYZ"[i] if kind == 'AXIS' else "".join("XYZ"[j] for j in axes)
+            if self.auto_locked:
+                label += " auto"
         text = f"Axis Grid Move [{label} {self.orient_name}]   "
         if self.num_text:
             text += f"Input: {self.num_text}|" + ("  (invalid)" if invalid else "") + "   "
@@ -743,7 +973,8 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
         elif t in {'X', 'Y', 'Z'} and event.value == 'PRESS':
             new = ('PLANE' if event.shift else 'AXIS', 'XYZ'.index(t))
-            self.constraint = None if self.constraint == new else new
+            # Pressing the same key again releases the lock (back to free / auto lock).
+            self.user_constraint = None if self.user_constraint == new else new
             self.update(context)
 
         elif t == 'BACK_SPACE' and event.value == 'PRESS' and self.num_text:
@@ -781,6 +1012,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
     def cleanup(self, context):
         bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+        bpy.types.SpaceView3D.draw_handler_remove(self._handle_px, 'WINDOW')
         context.area.header_text_set(None)
         context.workspace.status_text_set(None)
         context.area.tag_redraw()
@@ -897,7 +1129,16 @@ class VIEW3D_PT_axis_grid(bpy.types.Panel):
         layout.label(text="Typed Direction:")
         layout.row().prop(s, "typed_direction", expand=True)
         layout.prop(s, "snap_typed")
+        row = layout.row(align=True)
+        row.prop(s, "auto_lock")
+        sub = row.row(align=True)
+        sub.active = s.auto_lock
+        sub.prop(s, "auto_lock_angle")
+        row = layout.row()
+        row.active = s.auto_lock
+        row.prop(s, "auto_lock_source", expand=True)
         layout.prop(s, "extent")
+        layout.prop(s, "show_values")
 
         layout.separator()
         layout.operator(VIEW3D_OT_axis_grid_snap_selection.bl_idname, icon='SNAP_GRID')
