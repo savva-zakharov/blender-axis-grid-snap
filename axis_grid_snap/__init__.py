@@ -423,7 +423,8 @@ def _draw_edge_lengths(op):
             p = view3d_utils.location_3d_to_region_2d(region, rv3d, (a + b) / 2)
             if p is None:
                 continue  # behind the view
-            text = _fmt(context, (b - a).length)
+            text = _fmt(context, (b - a).length,
+                        magnitude=max(max(map(abs, a)), max(map(abs, b))))
             w, h = blf.dimensions(font, text)
             blf.position(font, p.x - w / 2, p.y - h / 2, 0)
             blf.draw(font, text)
@@ -624,17 +625,48 @@ LENGTH_UNITS = {
 }
 
 
-def _fmt(context, value, decimals=4):
+# Mesh coordinates are 32-bit floats (~7 significant digits), so values read off vertices
+# carry noise of about this fraction of the coordinates' size; differences below
+# FLOAT_NOISE_MIN metres (0.01 mm) are treated as noise too.
+FLOAT_NOISE = 1e-6
+FLOAT_NOISE_MIN = 1e-5
+
+
+def _strip(number):
+    """'450.500' -> '450.5', '450.000' -> '450', '450' -> '450', '-0' -> '0'."""
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return "0" if number == "-0" else number
+
+
+def _clean(x, decimals, tol):
+    """Round x to the fewest decimals (up to `decimals`) that stay within tol of it, so
+    float noise like 450.0001 or 0.89999 reads as 450 / 0.9 while 1.2375 stays 1.2375."""
+    for d in range(decimals + 1):
+        r = round(x, d)
+        if abs(r - x) <= tol:
+            return r, d
+    return round(x, decimals), decimals
+
+
+def _fmt(context, value, decimals=4, magnitude=0.0):
     """Format a length in the scene's chosen Length unit (not Blender's adaptive pick).
 
     Adaptive length or Separate Units fall back to Blender's own formatting.
+    `magnitude` is the size of the coordinates the value came from (e.g. an edge's
+    vertices), which sets how much float noise is rounded away.
     """
     us = context.scene.unit_settings
+    # The floor shrinks for tiny values so a real 0.675 mm isn't rounded away.
+    tol = (max(abs(value), magnitude) * FLOAT_NOISE
+           + min(FLOAT_NOISE_MIN / _unit_scale(us), abs(value) * 1e-3))
     if us.system == 'NONE':
-        return f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+        value, decimals = _clean(value, decimals, tol)
+        return _strip(f"{value:.{decimals}f}")
     metres = value * _unit_scale(us)
     unit = LENGTH_UNITS.get(us.length_unit)
     if unit is None or us.use_separate:
+        metres, _d = _clean(metres, decimals + 3, tol * _unit_scale(us))
         try:
             return bpy.utils.units.to_string(us.system, 'LENGTH', metres, precision=decimals,
                                              split_unit=us.use_separate)
@@ -644,9 +676,8 @@ def _fmt(context, value, decimals=4):
     x = metres / factor
     if 0 < abs(x) < 1:  # keep ~4 significant digits for small values (e.g. 0.000675 m)
         decimals = min(8, decimals + math.ceil(-math.log10(abs(x))))
-    number = f"{x:.{decimals}f}".rstrip("0").rstrip(".")
-    if number == "-0":
-        number = "0"
+    x, decimals = _clean(x, decimals, tol * _unit_scale(us) / factor)
+    number = _strip(f"{x:.{decimals}f}")
     return number + symbol if symbol in {"'", '"'} else f"{number} {symbol}"
 
 
