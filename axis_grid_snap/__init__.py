@@ -392,6 +392,44 @@ def _draw_cad_markers(op):
     gpu.state.blend_set('NONE')
 
 
+def _draw_edge_lengths(op):
+    """Edge Length overlay for the edges adjacent to the moved vertices.
+
+    Blender labels these itself only during its own transform; outside one it labels just
+    selected edges (which it keeps doing here), so the unselected neighbours are added
+    in the same theme colour. Lengths are in world space.
+    """
+    side_edges = getattr(op.mover, "side_edges", None)
+    context = bpy.context
+    space = context.space_data
+    if (not side_edges or space is None or not space.overlay.show_overlays
+            or not space.overlay.show_extra_edge_length):
+        return
+    region, rv3d = context.region, context.region_data
+    if rv3d is None:
+        return
+    ui = context.preferences.system.ui_scale
+    color = (*context.preferences.themes[0].view_3d.extra_edge_len, 1.0)
+    font = 0
+    blf.size(font, 11 * ui)
+    blf.enable(font, blf.SHADOW)
+    blf.shadow(font, 3, 0.0, 0.0, 0.0, 0.8)
+    blf.shadow_offset(font, 1, -1)
+    blf.color(font, *color)
+    for ob, edges in side_edges:
+        mw = ob.matrix_world
+        for e in edges:
+            a, b = mw @ e.verts[0].co, mw @ e.verts[1].co
+            p = view3d_utils.location_3d_to_region_2d(region, rv3d, (a + b) / 2)
+            if p is None:
+                continue  # behind the view
+            text = _fmt(context, (b - a).length)
+            w, h = blf.dimensions(font, text)
+            blf.position(font, p.x - w / 2, p.y - h / 2, 0)
+            blf.draw(font, text)
+    blf.disable(font, blf.SHADOW)
+
+
 def draw_labels(op):
     """Screen-space value labels for the ruler (axis moves) and grid floor (plane moves).
 
@@ -401,6 +439,7 @@ def draw_labels(op):
     On the grid floor that gives two crossing rulers. Labels that would overlap one already
     drawn are skipped, nearest-to-current first, so zooming out thins them.
     """
+    _draw_edge_lengths(op)
     if op.cad:
         _draw_cad_markers(op)
         if op.cad == 'BASE':
@@ -674,6 +713,7 @@ class MeshMover:
 
     def __init__(self, context):
         self.items = []  # (object, bmesh, verts, start coords, world->local 3x3)
+        self.side_edges = []  # (object, edges with one end moving)
         self.active = None
         for ob in context.objects_in_mode_unique_data:
             if ob.type != 'MESH':
@@ -684,6 +724,11 @@ class MeshMover:
                 continue
             self.items.append((ob, bm, verts, [v.co.copy() for v in verts],
                                ob.matrix_world.to_3x3().inverted_safe()))
+            # Unselected edges touching the selection: they stretch during the move, and
+            # Blender's Edge Length overlay only labels them inside its own transform.
+            side = {e for v in verts for e in v.link_edges if not e.select and not e.hide}
+            if side:
+                self.side_edges.append((ob, list(side)))
             if ob == context.active_object:
                 self.active = (ob, bm.select_history.active)
 
