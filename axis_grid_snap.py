@@ -2,7 +2,7 @@ bl_info = {
     "name": "Axis Grid Snap",
     "version": (0, 1, 0),
     "blender": (3, 6, 0),
-    "location": "3D View > Sidebar > Grid Snap  |  G in Object Mode",
+    "location": "3D View > Sidebar > Grid Snap  |  G in Object / Mesh Edit Mode",
     "description": "Move objects with separate snapping increments per axis, "
                    "with a ruler (single axis) or grid floor (plane) overlay",
     "category": "3D View",
@@ -10,6 +10,7 @@ bl_info = {
 
 import math
 
+import bmesh
 import bpy
 import gpu
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty
@@ -26,10 +27,19 @@ AXIS_COLORS = ((1.0, 0.21, 0.32), (0.54, 0.86, 0.0), (0.17, 0.56, 1.0))
 # Settings
 # ---------------------------------------------------------------------------
 
+def _spread_major_every(settings):
+    for axis in "xyz":
+        setattr(settings, f"major_{axis}", settings.major_every)
+
+
+MAJOR_DESC = ("Draw a coloured major line every N grid lines on this axis "
+              "(every N A+B pairs on a double grid). 0 turns major lines off")
+
+
 class AxisGridSettings(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Use for G",
-        description="Replace the G key in Object Mode with Axis Grid Move. "
+        description="Replace the G key in Object and Mesh Edit Mode with Axis Grid Move. "
                     "When off, G falls through to Blender's normal move",
         default=True,
     )
@@ -51,6 +61,14 @@ class AxisGridSettings(bpy.types.PropertyGroup):
                            subtype='DISTANCE', precision=4)
     step_z2: FloatProperty(name="Z B", default=0.25, min=1e-5, soft_max=100.0,
                            subtype='DISTANCE', precision=4)
+    major_x: IntProperty(name="X Major", default=5, min=0, soft_max=50, description=MAJOR_DESC)
+    major_y: IntProperty(name="Y Major", default=5, min=0, soft_max=50, description=MAJOR_DESC)
+    major_z: IntProperty(name="Z Major", default=5, min=0, soft_max=50, description=MAJOR_DESC)
+    # Superseded by major_x/y/z; kept so presets that set it still load (sets all three).
+    major_every: IntProperty(
+        name="Major Every", default=5, min=0, options={'HIDDEN'},
+        update=lambda self, _ctx: _spread_major_every(self),
+    )
     absolute: BoolProperty(
         name="Snap to World Grid",
         description="Snap the pivot onto world grid lines (on) or move in "
@@ -69,6 +87,12 @@ class AxisGridSettings(bpy.types.PropertyGroup):
         ),
         default='RELATIVE',
     )
+    snap_typed: BoolProperty(
+        name="Snap Typed Values",
+        description="Round typed distances to the nearest grid line, the same way mouse "
+                    "movement snaps (follows the snap toggle and Ctrl). Off: typed values are exact",
+        default=False,
+    )
     extent: IntProperty(
         name="Overlay Extent",
         description="Number of increments drawn on each side of the pivot",
@@ -78,7 +102,8 @@ class AxisGridSettings(bpy.types.PropertyGroup):
     def grids(self):
         a = (self.step_x, self.step_y, self.step_z)
         b = (self.step_x2, self.step_y2, self.step_z2) if self.use_double else a
-        return tuple(AxisGrid(a[i], b[i]) for i in range(3))
+        major = (self.major_x, self.major_y, self.major_z)
+        return tuple(AxisGrid(a[i], b[i], major[i]) for i in range(3))
 
 
 class AxisGrid:
@@ -88,8 +113,9 @@ class AxisGrid:
     ..., -(a+b), -b, 0, a, a+b, 2a+b, ... measured from the grid base.
     """
 
-    def __init__(self, a, b):
+    def __init__(self, a, b, major_every=5):
         self.a, self.b = a, b
+        self.major_every = major_every
         self.double = abs(a - b) > 1e-9
         self.scale = (a + b) * 0.5  # representative size for overlay tick lengths
 
@@ -105,8 +131,10 @@ class AxisGrid:
         return self.pos(self.nearest(t))
 
     def is_major(self, m):
-        # Every 5th period on a double grid (10 lines), every 5th line on a single one.
-        return m % (10 if self.double else 5) == 0
+        # Every Nth line on a single grid, every Nth A+B pair (2N lines) on a double one.
+        if self.major_every <= 0:
+            return False
+        return m % (self.major_every * (2 if self.double else 1)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -266,24 +294,65 @@ def _root_objects(objs):
     return roots
 
 
-def _orientation(context):
+def _edit_normal_rotation(ob):
+    """Approximation of Blender's Normal orientation for the edit-mesh selection.
+
+    Z follows the selected faces' (else vertices') average normal. Y lies along the longest
+    edge of the active face, if there is one, so a face's grid lines up with its edges.
+    Returns None when the selection has no usable normal.
+    """
+    if ob.type != 'MESH':
+        return None
+    bm = bmesh.from_edit_mesh(ob.data)
+    faces = [f for f in bm.faces if f.select]
+    elems = faces or [v for v in bm.verts if v.select]
+    n = sum((e.normal for e in elems), Vector())
+    if n.length < 1e-9:
+        return None
+    mw3 = ob.matrix_world.to_3x3()
+    z = (mw3.inverted_safe().transposed() @ n).normalized()  # normals use the inverse transpose
+
+    y = None
+    active = bm.select_history.active
+    if isinstance(active, bmesh.types.BMFace) and active.select:
+        edge = max(active.edges, key=lambda e: e.calc_length())
+        y = mw3 @ (edge.verts[1].co - edge.verts[0].co)
+        y -= z * y.dot(z)
+    if y is None or y.length < 1e-9:
+        return z.to_track_quat('Z', 'Y').to_matrix()
+    y.normalize()
+    return Matrix((y.cross(z), y, z)).transposed()
+
+
+def _orientation(context, ob=None):
     """(label, rotation 3x3, grid origin) for the scene's current transform orientation.
 
     Snapping happens in this frame: X/Y/Z constraints, increments, typed values and the
-    world-grid option all refer to its axes. Only Cursor moves the grid origin (to the cursor).
+    world-grid option all refer to its axes. The grid origin is the world origin in Object
+    Mode, the edited object's origin in Edit Mode, and the 3D cursor for Cursor orientation.
+    `ob` defaults to the active object.
     """
     scene = context.scene
     slot = scene.transform_orientation_slots[0]
     kind = slot.type
-    ob = context.active_object
-    origin = Vector()
-    if kind in {'LOCAL', 'NORMAL', 'GIMBAL'} and ob is not None:
-        # In Object Mode Normal equals Local; Gimbal is approximated by Local.
+    ob = ob or context.active_object
+    rv3d = context.region_data or getattr(context.space_data, "region_3d", None)
+    if context.mode == 'EDIT_MESH' and ob is not None:
+        origin = ob.matrix_world.translation.copy()
+    else:
+        origin = Vector()
+    edit_normal = (_edit_normal_rotation(ob)
+                   if kind == 'NORMAL' and context.mode == 'EDIT_MESH' and ob is not None else None)
+    if edit_normal is not None:
+        rot = edit_normal
+    elif kind in {'LOCAL', 'NORMAL', 'GIMBAL'} and ob is not None:
+        # In Object Mode Normal equals Local (as it does in Edit Mode with no usable
+        # selection normal); Gimbal is approximated by Local.
         rot = ob.matrix_world.to_quaternion().to_matrix()
     elif kind == 'PARENT' and ob is not None and ob.parent is not None:
         rot = ob.parent.matrix_world.to_quaternion().to_matrix()
-    elif kind == 'VIEW' and context.region_data is not None:
-        rot = context.region_data.view_rotation.to_matrix()
+    elif kind == 'VIEW' and rv3d is not None:
+        rot = rv3d.view_rotation.to_matrix()
     elif kind == 'CURSOR':
         rot = scene.cursor.matrix.to_quaternion().to_matrix()
         origin = scene.cursor.location.copy()
@@ -335,8 +404,143 @@ def _parse_length(context, text):
     return value / _unit_scale(us)
 
 
+# ---------------------------------------------------------------------------
+# What gets moved: whole objects (Object Mode) or selected vertices (Edit Mode)
+# ---------------------------------------------------------------------------
+
+class ObjectMover:
+    def __init__(self, context):
+        self.objs = _root_objects(list(context.selected_editable_objects))
+        self.start = [o.matrix_world.copy() for o in self.objs]
+        self.active = context.active_object
+
+    def __bool__(self):
+        return bool(self.objs)
+
+    def pivot(self):
+        """Active object's origin, else the median of the moved origins."""
+        if self.active in self.objs:
+            return self.active.matrix_world.translation.copy()
+        return sum((mw.translation for mw in self.start), Vector()) / len(self.start)
+
+    def apply(self, world_delta):
+        t = Matrix.Translation(world_delta)
+        for o, mw in zip(self.objs, self.start):
+            o.matrix_world = t @ mw
+
+    def restore(self):
+        for o, mw in zip(self.objs, self.start):
+            o.matrix_world = mw
+
+
+class MeshMover:
+    """Selected vertices of every mesh in Edit Mode (multi-object editing included)."""
+
+    def __init__(self, context):
+        self.items = []  # (object, bmesh, verts, start coords, world->local 3x3)
+        self.active = None
+        for ob in context.objects_in_mode_unique_data:
+            if ob.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(ob.data)
+            verts = [v for v in bm.verts if v.select and not v.hide]
+            if not verts:
+                continue
+            self.items.append((ob, bm, verts, [v.co.copy() for v in verts],
+                               ob.matrix_world.to_3x3().inverted_safe()))
+            if ob == context.active_object:
+                self.active = (ob, bm.select_history.active)
+
+    def __bool__(self):
+        return bool(self.items)
+
+    def pivot(self):
+        """Active vertex/edge/face (its median), else the median of all selected vertices."""
+        if self.active and self.active[1] is not None and self.active[1].select:
+            ob, elem = self.active
+            vs = [elem] if isinstance(elem, bmesh.types.BMVert) else list(elem.verts)
+            return ob.matrix_world @ (sum((v.co for v in vs), Vector()) / len(vs))
+        total, count = Vector(), 0
+        for ob, _bm, verts, start, _inv in self.items:
+            mw = ob.matrix_world
+            for co in start:
+                total += mw @ co
+            count += len(start)
+        return total / count
+
+    def apply(self, world_delta):
+        for ob, _bm, verts, start, inv in self.items:
+            local = inv @ world_delta
+            for v, co in zip(verts, start):
+                v.co = co + local
+            bmesh.update_edit_mesh(ob.data, loop_triangles=True, destructive=False)
+
+    def restore(self):
+        self.apply(Vector())
+
+
+def _snap_world(point, grids, rot, origin):
+    """Snap a world-space point onto the grid on all three axes of the given frame."""
+    local = rot.transposed() @ (point - origin)
+    local = Vector([grids[i].snap(local[i]) for i in range(3)])
+    return origin + rot @ local
+
+
+class VIEW3D_OT_axis_grid_snap_selection(bpy.types.Operator):
+    """Snap each selected object origin (Object Mode) or vertex (Edit Mode) to the nearest
+    point of the current Axis Grid, using the active transform orientation"""
+    bl_idname = "view3d.axis_grid_snap_selection"
+    bl_label = "Selection to Axis Grid"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in {'OBJECT', 'EDIT_MESH'}
+
+    def execute(self, context):
+        grids = context.scene.axis_grid.grids()
+        count = 0
+        if context.mode == 'EDIT_MESH':
+            # Each mesh snaps on its own grid, starting at that object's origin.
+            for ob in context.objects_in_mode_unique_data:
+                if ob.type != 'MESH':
+                    continue
+                _name, rot, origin = _orientation(context, ob)
+                mw = ob.matrix_world
+                mw_inv = mw.inverted_safe()
+                bm = bmesh.from_edit_mesh(ob.data)
+                verts = [v for v in bm.verts if v.select and not v.hide]
+                for v in verts:
+                    v.co = mw_inv @ _snap_world(mw @ v.co, grids, rot, origin)
+                count += len(verts)
+                bmesh.update_edit_mesh(ob.data, loop_triangles=True, destructive=False)
+            what = "vertices"
+        else:
+            _name, rot, origin = _orientation(context)
+            objs = _root_objects(list(context.selected_editable_objects))
+            for o in objs:
+                loc = o.matrix_world.translation
+                o.matrix_world = Matrix.Translation(_snap_world(loc, grids, rot, origin) - loc) @ o.matrix_world
+            count = len(objs)
+            what = "objects"
+        if not count:
+            self.report({'WARNING'}, "Nothing selected")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Snapped {count} {what} to the Axis Grid")
+        return {'FINISHED'}
+
+
+def _snap_menu_entry(self, context):
+    self.layout.separator()
+    self.layout.operator(VIEW3D_OT_axis_grid_snap_selection.bl_idname, icon='SNAP_GRID')
+
+
+def _make_mover(context):
+    return MeshMover(context) if context.mode == 'EDIT_MESH' else ObjectMover(context)
+
+
 class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
-    """Move selected objects, snapping each axis to its own increment"""
+    """Move selected objects or mesh elements, snapping each axis to its own increment"""
     bl_idname = "view3d.axis_grid_move"
     bl_label = "Axis Grid Move"
     bl_options = {'REGISTER', 'UNDO'}
@@ -345,15 +549,15 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.mode == 'OBJECT'
+        return (context.mode in {'OBJECT', 'EDIT_MESH'}
                 and context.area is not None and context.area.type == 'VIEW_3D'
                 and context.region is not None and context.region.type == 'WINDOW')
 
     # Redo panel / scripted use: apply the stored offset directly.
     def execute(self, context):
-        t = Matrix.Translation(Vector(self.offset))
-        for o in _root_objects(list(context.selected_editable_objects)):
-            o.matrix_world = t @ o.matrix_world
+        mover = _make_mover(context)
+        if mover:
+            mover.apply(Vector(self.offset))
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -361,16 +565,10 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         if not settings.enabled:
             return {'PASS_THROUGH'}  # let Blender's own G handle it
 
-        self.objs = _root_objects(list(context.selected_editable_objects))
-        if not self.objs:
+        self.mover = _make_mover(context)
+        if not self.mover:
             return {'PASS_THROUGH'}
-        self.start_mw = [o.matrix_world.copy() for o in self.objs]
-
-        active = context.active_object
-        if active in self.objs:
-            pivot_world = active.matrix_world.translation.copy()
-        else:
-            pivot_world = sum((mw.translation for mw in self.start_mw), Vector()) / len(self.start_mw)
+        pivot_world = self.mover.pivot()
 
         # pivot / target / delta are kept in orientation space; see to_world().
         self.orient_name, self.rot, self.origin = _orientation(context)
@@ -381,9 +579,11 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         self.grids = settings.grids()
         self.absolute = settings.absolute
         self.relative_dir = settings.typed_direction == 'RELATIVE'
+        self.snap_typed = settings.snap_typed
         self.extent = settings.extent
         self.constraint = None          # None | ('AXIS', i) | ('PLANE', normal_i)
-        self.snap = True
+        self.snap_toggle = context.scene.tool_settings.use_snap  # the header's magnet button
+        self.snap = self.snap_toggle
         self.num_text = ""              # typed distance; when non-empty it overrides the mouse
         self.mouse_start = Vector((event.mouse_region_x, event.mouse_region_y))
         self.mouse = self.mouse_start.copy()
@@ -395,7 +595,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         context.window_manager.modal_handler_add(self)
         context.workspace.status_text_set(
             "LMB/Enter: confirm   RMB/Esc: cancel   X/Y/Z: axis   "
-            "Shift+X/Y/Z: plane   Ctrl: disable snap   "
+            "Shift+X/Y/Z: plane   Ctrl: toggle snap   "
             "Type: distance (a,b for planes)   Backspace: edit")
         self.update(context)
         return {'RUNNING_MODAL'}
@@ -479,14 +679,14 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             if delta is None:
                 self.set_header(context, axes, invalid=True)
                 return
-            self.apply(context, delta, axes)
-            return
+            snap = self.snap and self.snap_typed  # typed values are exact unless opted in
+        else:
+            delta = self.mouse_delta(context, axes)
+            if delta is None:
+                return
+            snap = self.snap
 
-        delta = self.mouse_delta(context, axes)
-        if delta is None:
-            return
-
-        if self.snap:
+        if snap:
             if self.absolute:
                 target = self.pivot + delta
                 for i in axes:
@@ -502,9 +702,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         self.delta = delta
         self.target = self.pivot + delta
         self.world_delta = self.rot @ delta
-        t = Matrix.Translation(self.world_delta)
-        for o, mw in zip(self.objs, self.start_mw):
-            o.matrix_world = t @ mw
+        self.mover.apply(self.world_delta)
         self.set_header(context, axes)
 
     def set_header(self, context, axes, invalid=False):
@@ -516,7 +714,10 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
         if self.num_text:
             text += f"Input: {self.num_text}|" + ("  (invalid)" if invalid else "") + "   "
         text += "   ".join(f"{'XYZ'[i]}: {_fmt(context, self.delta[i])}" for i in axes)
-        if not self.snap and not self.num_text:
+        if self.num_text:
+            if self.snap and self.snap_typed:
+                text += "   (snapped to grid)"
+        elif not self.snap:
             text += "   (snap off)"
         context.area.header_text_set(text)
 
@@ -532,11 +733,12 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
 
         if t == 'MOUSEMOVE':
             self.mouse = Vector((event.mouse_region_x, event.mouse_region_y))
-            self.snap = not event.ctrl
+            self.snap = self.snap_toggle != event.ctrl
             self.update(context)
 
         elif t in {'LEFT_CTRL', 'RIGHT_CTRL'}:
-            self.snap = event.value == 'RELEASE'
+            # Like native snapping: Ctrl inverts the header's snap (magnet) toggle while held.
+            self.snap = self.snap_toggle != (event.value == 'PRESS')
             self.update(context)
 
         elif t in {'X', 'Y', 'Z'} and event.value == 'PRESS':
@@ -561,8 +763,7 @@ class VIEW3D_OT_axis_grid_move(bpy.types.Operator):
             return {'FINISHED'}
 
         elif t in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
-            for o, mw in zip(self.objs, self.start_mw):
-                o.matrix_world = mw
+            self.mover.restore()
             self.cleanup(context)
             return {'CANCELLED'}
 
@@ -598,16 +799,18 @@ class AXISGRID_OT_execute_preset(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE'})
 
     def execute(self, context):
-        # Presets saved before Double Grid existed don't set it; treat them as single grids
-        # rather than inheriting whatever the previous preset left switched on.
+        # Presets saved before a setting existed don't set it. Reset those settings to their
+        # defaults rather than inheriting whatever the previous preset left behind.
         try:
             with open(self.filepath, encoding="utf-8") as f:
-                legacy = "use_double" not in f.read()
+                text = f.read()
         except OSError:
             self.report({'ERROR'}, f"Preset not found: {self.filepath}")
             return {'CANCELLED'}
-        if legacy:
-            context.scene.axis_grid.use_double = False
+        s = context.scene.axis_grid
+        for prop in ("use_double", "major_x", "major_y", "major_z"):
+            if f"s.{prop} " not in text:
+                s.property_unset(prop)
         # Menu.path_menu only fills menu_idname for script.execute_preset, so pass it here.
         return bpy.ops.script.execute_preset(filepath=self.filepath, menu_idname="AXISGRID_MT_presets")
 
@@ -627,7 +830,56 @@ class AXISGRID_OT_preset_add(AddPresetBase, bpy.types.Operator):
     preset_subdir = "axis_grid_snap"
     preset_defines = ["s = bpy.context.scene.axis_grid"]
     preset_values = ["s.step_x", "s.step_y", "s.step_z",
-                     "s.use_double", "s.step_x2", "s.step_y2", "s.step_z2"]
+                     "s.use_double", "s.step_x2", "s.step_y2", "s.step_z2",
+                     "s.major_x", "s.major_y", "s.major_z"]
+
+
+def _draw_spacing(layout, s):
+    """Presets + per-axis spacing fields; shared by the sidebar panel and the snap popover."""
+    row = layout.row(align=True)
+    row.menu("AXISGRID_MT_presets", text=AXISGRID_MT_presets.bl_label)
+    row.operator("axis_grid.preset_add", text="", icon='ADD')
+    row.operator("axis_grid.preset_add", text="", icon='REMOVE').remove_active = True
+
+    layout.prop(s, "use_double")
+
+    # Table: axis | spacing (A, B on a double grid) | major line interval
+    def narrow(row, units):
+        sub = row.row(align=True)
+        sub.ui_units_x = units
+        return sub
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    narrow(row, 1).label(text="")
+    if s.use_double:
+        row.label(text="A")
+        row.label(text="B")
+    else:
+        row.label(text="Spacing")
+    narrow(row, 3).label(text="Major")
+    for axis in "xyz":
+        row = col.row(align=True)
+        narrow(row, 1).label(text=axis.upper())
+        row.prop(s, f"step_{axis}", text="")
+        if s.use_double:
+            row.prop(s, f"step_{axis}2", text="")
+        narrow(row, 3).prop(s, f"major_{axis}", text="")
+
+
+def _draw_snap_popover(self, context):
+    """Axis Grid section appended to the header's Snapping popover."""
+    if context.mode not in {'OBJECT', 'EDIT_MESH'}:
+        return
+    s = context.scene.axis_grid
+    layout = self.layout
+    layout.separator()
+    layout.label(text="Axis Grid")
+    layout.prop(s, "enabled", text="Use Axis Grid for Move (G)")
+    if s.enabled:
+        _draw_spacing(layout, s)
+    else:
+        layout.label(text="Off while using a Snap Target above", icon='INFO')
 
 
 class VIEW3D_PT_axis_grid(bpy.types.Panel):
@@ -640,43 +892,54 @@ class VIEW3D_PT_axis_grid(bpy.types.Panel):
         s = context.scene.axis_grid
         layout = self.layout
         layout.prop(s, "enabled")
-
-        row = layout.row(align=True)
-        row.menu("AXISGRID_MT_presets", text=AXISGRID_MT_presets.bl_label)
-        row.operator("axis_grid.preset_add", text="", icon='ADD')
-        row.operator("axis_grid.preset_add", text="", icon='REMOVE').remove_active = True
-
-        layout.prop(s, "use_double")
-        col = layout.column(align=True)
-        if s.use_double:
-            row = col.row(align=True)
-            row.label(text="")
-            row.label(text="A")
-            row.label(text="B")
-            for axis in "xyz":
-                row = col.row(align=True)
-                row.label(text=axis.upper())
-                row.prop(s, f"step_{axis}", text="")
-                row.prop(s, f"step_{axis}2", text="")
-        else:
-            col.label(text="Increment per axis:")
-            col.prop(s, "step_x")
-            col.prop(s, "step_y")
-            col.prop(s, "step_z")
-
+        _draw_spacing(layout, s)
         layout.prop(s, "absolute")
         layout.label(text="Typed Direction:")
         layout.row().prop(s, "typed_direction", expand=True)
+        layout.prop(s, "snap_typed")
         layout.prop(s, "extent")
+
+        layout.separator()
+        layout.operator(VIEW3D_OT_axis_grid_snap_selection.bl_idname, icon='SNAP_GRID')
 
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
+# Picking any native Snap Target in the Snapping popover switches the Axis Grid off, so
+# the two work like a choice: either native snapping or Axis Grid. Ticking "Use Axis Grid"
+# turns it back on. (msgbus only reports changes made through the UI, not from scripts.)
+SNAP_TARGET_PROPS = ("snap_elements", "snap_elements_base", "snap_elements_individual")
+_msgbus_owner = object()
+
+
+def _on_snap_target_changed():
+    scene = bpy.context.scene
+    if scene is not None and scene.axis_grid.enabled:
+        scene.axis_grid.enabled = False
+
+
+def _subscribe_snap_targets():
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
+    for prop in SNAP_TARGET_PROPS:
+        bpy.msgbus.subscribe_rna(
+            key=(bpy.types.ToolSettings, prop),
+            owner=_msgbus_owner,
+            args=(),
+            notify=_on_snap_target_changed,
+        )
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(_dummy):
+    _subscribe_snap_targets()  # opening a file drops all msgbus subscriptions
+
+
 classes = (
     AxisGridSettings,
     VIEW3D_OT_axis_grid_move,
+    VIEW3D_OT_axis_grid_snap_selection,
     AXISGRID_OT_execute_preset,
     AXISGRID_MT_presets,
     AXISGRID_OT_preset_add,
@@ -689,18 +952,28 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.axis_grid = PointerProperty(type=AxisGridSettings)
+    bpy.types.VIEW3D_MT_snap.append(_snap_menu_entry)  # Object/Mesh > Snap menu
+    bpy.types.VIEW3D_PT_snapping.append(_draw_snap_popover)  # header magnet popover
+    _subscribe_snap_targets()
+    bpy.app.handlers.load_post.append(_on_load_post)
 
-    kc = bpy.context.window_manager.keyconfigs.addon
+    kc =bpy.context.window_manager.keyconfigs.addon
     if kc:
-        km = kc.keymaps.new(name="Object Mode", space_type='EMPTY')
-        kmi = km.keymap_items.new(VIEW3D_OT_axis_grid_move.bl_idname, 'G', 'PRESS')
-        addon_keymaps.append((km, kmi))
+        for name in ("Object Mode", "Mesh"):
+            km = kc.keymaps.new(name=name, space_type='EMPTY')
+            kmi = km.keymap_items.new(VIEW3D_OT_axis_grid_move.bl_idname, 'G', 'PRESS')
+            addon_keymaps.append((km, kmi))
 
 
 def unregister():
     for km, kmi in addon_keymaps:
         km.keymap_items.remove(kmi)
     addon_keymaps.clear()
+    bpy.types.VIEW3D_MT_snap.remove(_snap_menu_entry)
+    bpy.types.VIEW3D_PT_snapping.remove(_draw_snap_popover)
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
     del bpy.types.Scene.axis_grid
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
